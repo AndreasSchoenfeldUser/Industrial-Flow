@@ -47,6 +47,8 @@ Privater Container-Registry-Mirror, lokaler Plugin-Mirror, Multi-Site-Controller
 - Recharts für Diagramme im Compliance-View
 - Vitest und React Testing Library
 - pnpm als Paketmanager
+- Docker (Multi-Stage, Next.js standalone) und Caddy als TLS-Reverse-Proxy für das VM-Deployment
+- GitHub Actions als CI/CD, GitHub Container Registry als Image-Registry
 
 ### Phase 2
 - Jenkins LTS (jdk21)
@@ -77,6 +79,9 @@ Privater Container-Registry-Mirror, lokaler Plugin-Mirror, Multi-Site-Controller
 
 ```
 industrialflow/
+├── .github/
+│   └── workflows/
+│       └── deploy.yml        # CI/CD: Quality-Gate → Image → SSH-Deploy (Phase 1+)
 ├── apps/
 │   ├── web/                  # Next.js-Frontend (Phase 1+)
 │   └── bff/                  # Backend-for-Frontend (Phase 2+)
@@ -88,12 +93,16 @@ industrialflow/
 │   ├── ot-proxy/             # OT-Proxy-Agent in Go (Phase 4+)
 │   └── opcua-bridge/         # OPC-UA-Bridge (Phase 4+)
 ├── infra/
-│   ├── docker-compose.yml    # Jenkins + BFF + UI (Phase 2+)
-│   ├── jcasc/                # Jenkins Configuration as Code (Phase 2+)
-│   └── policies/             # OPA-Rego-Policies (Phase 5+)
+│   ├── docker-compose.prod.yml  # VM-Stack: web + Caddy (Phase 1+)
+│   ├── docker-compose.yml       # Jenkins + BFF + UI (Phase 2+)
+│   ├── caddy/Caddyfile          # TLS + Let's Encrypt (Phase 1+)
+│   ├── jcasc/                   # Jenkins Configuration as Code (Phase 2+)
+│   └── policies/                # OPA-Rego-Policies (Phase 5+)
 ├── docs/
 │   ├── architektur.md
 │   └── compliance.md
+├── Dockerfile                # Multi-Stage Build der Next.js-App (Phase 1+)
+├── .dockerignore
 └── CLAUDE.md
 ```
 
@@ -394,6 +403,61 @@ production_lock:
 - Plugin-Mirror für Jenkins-Updates ohne Internetzugang
 - Multi-Site-Controller: zentrale IndustrialFlow-Instanz steuert mehrere Werke, jedes Werk hat seinen eigenen OT-Proxy-Agent und eigene Wartungsfenster
 - Komplette Offline-Installation per `docker compose up -d` aus einem zuvor heruntergeladenen Image-Tarball
+
+---
+
+## Deployment
+
+Die Plattform läuft auf einer VM hinter Caddy mit automatischem Let's Encrypt. Domain für die öffentliche Phase-1-Demo: `industrial-flow.comquent.academy`. Der Stack ist von Anfang an Container-basiert, damit Phase 2 ihn nahtlos um Jenkins, BFF und Postgres erweitern kann.
+
+### VM-Voraussetzungen
+
+- Ubuntu 24.04 LTS oder Debian 12
+- Docker Engine ≥ 24, Docker Compose Plugin ≥ 2.20
+- Phase 1: 2 vCPU, 2 GB RAM, 20 GB SSD. Phase 2 mit Jenkins/Postgres: 4 vCPU, 8 GB RAM, 80 GB SSD
+- Ports 80 und 443 öffentlich erreichbar — Port 80 zwingend für die HTTP-01-Challenge von Let's Encrypt
+- DNS-A-Record `industrial-flow.comquent.academy` muss vor dem ersten Deploy aktiv sein
+- Deploy-User in der `docker`-Gruppe, Arbeitsverzeichnis `/opt/industrial-flow/`, kein root-Login
+
+Einmalige Bootstrap-Befehle auf der VM:
+
+```bash
+sudo apt update && sudo apt install -y docker.io docker-compose-plugin
+sudo usermod -aG docker $USER && newgrp docker
+sudo mkdir -p /opt/industrial-flow && sudo chown $USER:$USER /opt/industrial-flow
+```
+
+### Stack auf der VM
+
+- `infra/docker-compose.prod.yml` definiert zwei Services: `web` (Next.js standalone aus dem Repo-`Dockerfile`) und `caddy` (Reverse-Proxy)
+- `infra/caddy/Caddyfile` terminiert TLS, setzt HSTS und proxyt nach `web:3000`
+- Caddy persistiert Zertifikate im benannten Volume `caddy_data` — dieses Volume nie löschen, sonst Rate-Limit von Let's Encrypt (5 Certs / 7 Tage)
+
+### Image-Registry
+
+- GitHub Container Registry: `ghcr.io/<owner>/<repo>`
+- Tags: `sha-<short>` für jeden Commit, zusätzlich `latest` auf `main`
+- Bei privatem Repo: PAT mit Scope `read:packages` als Secret `GHCR_PAT` setzen und im Workflow den Login-Block einkommentieren
+
+### CI/CD-Pipeline (`.github/workflows/deploy.yml`)
+
+1. **quality** — `pnpm install --frozen-lockfile`, dann `pnpm typecheck` und `pnpm test`. Quality-Gate vor jedem Deploy.
+2. **build-push** — Multi-stage Docker-Build mit BuildKit-Cache (GHA), Push zu GHCR.
+3. **deploy** — SCP der Compose-Dateien nach `/opt/industrial-flow/`, SSH rendert `.env` aus Secrets und führt `docker compose pull && up -d` aus.
+4. **smoke-test** — Polling von `https://industrial-flow.comquent.academy/dashboard`, bis 200 zurückkommt. Erste Cert-Ausstellung dauert beim ersten Run typischerweise 10–30 s.
+
+### GitHub-Secrets
+
+| Secret | Inhalt |
+|---|---|
+| `SSH_HOST` | `industrial-flow.comquent.academy` oder VM-IP |
+| `SSH_USER` | Deploy-User auf der VM |
+| `SSH_PRIVATE_KEY` | PEM-Key, dessen Public-Pendant in `~/.ssh/authorized_keys` liegt |
+| `SSH_PORT` | optional, Standard 22 |
+| `ACME_EMAIL` | E-Mail für Let's Encrypt-Benachrichtigungen |
+| `GHCR_PAT` | nur bei privatem Repo, Scope `read:packages` |
+
+Phase 2 erweitert `infra/docker-compose.prod.yml` um Jenkins, BFF und Postgres im selben internen Docker-Netz; Caddy bleibt der einzige TLS-Termination-Punkt und proxyt zusätzlich auf den BFF.
 
 ---
 
