@@ -111,15 +111,41 @@ jobs:
             echo "Hinterlege sie unter Settings → Secrets and variables → Actions oder Settings → Environments → production."
             exit 1
           fi
-          if ! printf '%s' "${SSH_PRIVATE_KEY}" | grep -q -- "-----BEGIN .* PRIVATE KEY-----"; then
-            echo "::error::SSH_PRIVATE_KEY ist gesetzt, sieht aber nicht wie ein PEM-Key aus (fehlende BEGIN-Zeile). Komplette Key-Datei inkl. BEGIN/END-Zeilen einfügen."
-            exit 1
+
+          key_file="$(mktemp)"
+          chmod 600 "${key_file}"
+          # printf %s preserves the literal env var content (incl. newlines) ohne extra Zeilenumbruch.
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > "${key_file}"
+
+          line_count=$(wc -l < "${key_file}")
+          byte_count=$(wc -c < "${key_file}")
+          echo "Key-Datei: ${line_count} Zeilen, ${byte_count} Bytes"
+
+          if ! grep -q -- "-----BEGIN .* PRIVATE KEY-----" "${key_file}"; then
+            echo "::error::SSH_PRIVATE_KEY ohne BEGIN-Zeile — komplette Key-Datei inkl. Header einfügen."
+            rm -f "${key_file}"; exit 1
           fi
-          if ! printf '%s' "${SSH_PRIVATE_KEY}" | grep -q -- "-----END .* PRIVATE KEY-----"; then
-            echo "::error::SSH_PRIVATE_KEY hat keine END-Zeile — vermutlich abgeschnitten."
-            exit 1
+          if ! grep -q -- "-----END .* PRIVATE KEY-----" "${key_file}"; then
+            echo "::error::SSH_PRIVATE_KEY ohne END-Zeile — Key vermutlich abgeschnitten."
+            rm -f "${key_file}"; exit 1
           fi
-          echo "Secrets vollständig. Key-Länge: $(printf '%s' "${SSH_PRIVATE_KEY}" | wc -c) Bytes."
+          if [ "${line_count}" -lt 3 ]; then
+            echo "::error::Key hat nur ${line_count} Zeile(n) — Newlines wurden beim Einfügen entfernt."
+            echo "Fix: lokal 'gh secret set SSH_PRIVATE_KEY < /pfad/zum/key' verwenden, statt im Browser einzufügen."
+            rm -f "${key_file}"; exit 1
+          fi
+
+          # Echter Parse-Test: ssh-keygen -y leitet den Public-Key ab und schlägt
+          # fehl mit der konkreten Ursache, wenn der Key syntaktisch kaputt ist.
+          if ! out=$(ssh-keygen -y -P "" -f "${key_file}" 2>&1); then
+            echo "::error::Key parse fehlgeschlagen: ${out}"
+            echo "Häufigste Ursache: Zeilenumbrüche beim Einfügen ins Secret-Feld verloren gegangen."
+            echo "Fix: 'gh secret set SSH_PRIVATE_KEY --repo <owner>/<repo> < /pfad/zum/key' (transferiert Datei 1:1)."
+            echo "Bei Passphrase-geschütztem Key: passphrase-input ergänzen oder neuen Key ohne Passphrase erzeugen."
+            rm -f "${key_file}"; exit 1
+          fi
+          echo "Key valide. Public-Key-Typ: $(echo "${out}" | awk '{print $1}')"
+          rm -f "${key_file}"
 
       - name: Copy compose stack to VM
         uses: appleboy/scp-action@v1.0.0
