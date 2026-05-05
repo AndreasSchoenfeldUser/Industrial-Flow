@@ -112,40 +112,65 @@ jobs:
             exit 1
           fi
 
+          raw_file="$(mktemp)"
           key_file="$(mktemp)"
-          chmod 600 "${key_file}"
-          # printf %s preserves the literal env var content (incl. newlines) ohne extra Zeilenumbruch.
-          printf '%s\n' "${SSH_PRIVATE_KEY}" > "${key_file}"
+          chmod 600 "${raw_file}" "${key_file}"
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > "${raw_file}"
 
-          line_count=$(wc -l < "${key_file}")
-          byte_count=$(wc -c < "${key_file}")
-          echo "Key-Datei: ${line_count} Zeilen, ${byte_count} Bytes"
+          # Diagnose der Hülle, bevor wir auto-bereinigen.
+          raw_lines=$(wc -l < "${raw_file}")
+          raw_bytes=$(wc -c < "${raw_file}")
+          echo "Roh-Key: ${raw_lines} Zeilen, ${raw_bytes} Bytes"
 
-          if ! grep -q -- "-----BEGIN .* PRIVATE KEY-----" "${key_file}"; then
-            echo "::error::SSH_PRIVATE_KEY ohne BEGIN-Zeile — komplette Key-Datei inkl. Header einfügen."
-            rm -f "${key_file}"; exit 1
+          # 1. UTF-8 BOM am Anfang erkennen.
+          if head -c 3 "${raw_file}" | od -An -tx1 | tr -d ' \n' | grep -q "^efbbbf"; then
+            echo "::warning::UTF-8 BOM am Key-Anfang gefunden — wird entfernt."
+            tail -c +4 "${raw_file}" > "${raw_file}.nobom" && mv "${raw_file}.nobom" "${raw_file}"
+          fi
+
+          # 2. CRLF erkennen und konvertieren.
+          if grep -q $'\r' "${raw_file}"; then
+            cr_lines=$(grep -c $'\r' "${raw_file}")
+            echo "::warning::Key enthält CR-Zeichen auf ${cr_lines} Zeilen (CRLF-Endings) — wird zu LF normalisiert."
+            tr -d '\r' < "${raw_file}" > "${key_file}"
+          else
+            cp "${raw_file}" "${key_file}"
+          fi
+
+          # 3. Encrypted Legacy-PEM erkennen.
+          if grep -q "Proc-Type: 4,ENCRYPTED" "${key_file}"; then
+            echo "::error::Key ist passphrase-geschützt (Proc-Type: 4,ENCRYPTED). CI-Keys sollten ohne Passphrase angelegt werden."
+            echo "Fix: 'ssh-keygen -t ed25519 -f if-ci-key -N \"\"' und neuen Public-Key in authorized_keys eintragen."
+            rm -f "${raw_file}" "${key_file}"; exit 1
+          fi
+
+          # 4. Hülle prüfen.
+          begin_line=$(grep -m1 -- "-----BEGIN .* PRIVATE KEY-----" "${key_file}" || true)
+          if [ -z "${begin_line}" ]; then
+            echo "::error::SSH_PRIVATE_KEY ohne BEGIN-Zeile."
+            rm -f "${raw_file}" "${key_file}"; exit 1
           fi
           if ! grep -q -- "-----END .* PRIVATE KEY-----" "${key_file}"; then
             echo "::error::SSH_PRIVATE_KEY ohne END-Zeile — Key vermutlich abgeschnitten."
-            rm -f "${key_file}"; exit 1
+            rm -f "${raw_file}" "${key_file}"; exit 1
           fi
-          if [ "${line_count}" -lt 3 ]; then
-            echo "::error::Key hat nur ${line_count} Zeile(n) — Newlines wurden beim Einfügen entfernt."
-            echo "Fix: lokal 'gh secret set SSH_PRIVATE_KEY < /pfad/zum/key' verwenden, statt im Browser einzufügen."
-            rm -f "${key_file}"; exit 1
-          fi
+          echo "Key-Format laut Header: ${begin_line}"
 
-          # Echter Parse-Test: ssh-keygen -y leitet den Public-Key ab und schlägt
-          # fehl mit der konkreten Ursache, wenn der Key syntaktisch kaputt ist.
+          # 5. Echter Parse-Test.
           if ! out=$(ssh-keygen -y -P "" -f "${key_file}" 2>&1); then
             echo "::error::Key parse fehlgeschlagen: ${out}"
-            echo "Häufigste Ursache: Zeilenumbrüche beim Einfügen ins Secret-Feld verloren gegangen."
-            echo "Fix: 'gh secret set SSH_PRIVATE_KEY --repo <owner>/<repo> < /pfad/zum/key' (transferiert Datei 1:1)."
-            echo "Bei Passphrase-geschütztem Key: passphrase-input ergänzen oder neuen Key ohne Passphrase erzeugen."
-            rm -f "${key_file}"; exit 1
+            echo "Hex-Dump erste 32 Bytes (zur Diagnose):"
+            head -c 32 "${key_file}" | od -An -c | head -3
+            echo ""
+            echo "Mögliche Ursachen:"
+            echo " - Whitespace mitten in einer Base64-Zeile (z. B. durch Mail-Wrap bei 76 Zeichen)"
+            echo " - Truncation in der Mitte (BEGIN/END da, aber ein Block verschluckt)"
+            echo " - Falsche Encoding-Variante (PuTTY .ppk statt OpenSSH/PEM)"
+            echo "Fix: lokal neu erzeugen, dann 'gh secret set SSH_PRIVATE_KEY --repo <owner>/<repo> < /pfad/zum/key'."
+            rm -f "${raw_file}" "${key_file}"; exit 1
           fi
           echo "Key valide. Public-Key-Typ: $(echo "${out}" | awk '{print $1}')"
-          rm -f "${key_file}"
+          rm -f "${raw_file}" "${key_file}"
 
       - name: Copy compose stack to VM
         uses: appleboy/scp-action@v1.0.0
